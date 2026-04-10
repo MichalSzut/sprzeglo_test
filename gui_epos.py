@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QComboBox, QTextEdit, QLineEdit, QMessageBox,
+    QLabel, QPushButton, QComboBox, QLineEdit, QMessageBox,
     QGroupBox, QRadioButton
 )
 
@@ -12,7 +12,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EPOS4 GUI")
-        self.resize(980, 760)
+        self.resize(980, 620)
 
         self.serial = QSerialPort(self)
         self.serial.setBaudRate(115200)
@@ -22,9 +22,12 @@ class MainWindow(QWidget):
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.request_status)
 
+        self.last_status = {}
+
         self.build_ui()
         self.refresh_ports()
         self.update_mode_controls()
+        self.update_buttons_from_state()
 
     def build_ui(self):
         root = QVBoxLayout(self)
@@ -124,9 +127,6 @@ class MainWindow(QWidget):
         self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.status_label.setWordWrap(True)
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-
         root.addWidget(port_box)
         root.addWidget(mode_box)
         root.addWidget(posmode_box)
@@ -134,17 +134,13 @@ class MainWindow(QWidget):
         root.addWidget(control_box)
         root.addWidget(QLabel("Status:"))
         root.addWidget(self.status_label)
-        root.addWidget(QLabel("Log:"))
-        root.addWidget(self.log, 1)
-
-    def append_log(self, text: str):
-        self.log.append(text)
 
     def update_mode_controls(self):
+        connected = self.serial.isOpen()
         is_pos = self.pos_radio.isChecked()
-        self.abs_radio.setEnabled(is_pos)
-        self.rel_radio.setEnabled(is_pos)
-        self.pos_edit.setEnabled(is_pos)
+        self.abs_radio.setEnabled(connected and is_pos)
+        self.rel_radio.setEnabled(connected and is_pos)
+        self.pos_edit.setEnabled(connected and is_pos)
 
     @Slot()
     def refresh_ports(self):
@@ -153,12 +149,10 @@ class MainWindow(QWidget):
         for port in ports:
             label = f"{port.portName()} | {port.description()}"
             self.port_combo.addItem(label, port.portName())
-        self.append_log("Odświeżono listę portów.")
 
     @Slot()
     def connect_port(self):
         if self.serial.isOpen():
-            self.append_log("Port już otwarty.")
             return
 
         if self.port_combo.currentIndex() < 0:
@@ -171,7 +165,6 @@ class MainWindow(QWidget):
         ok = self.serial.open(QSerialPort.ReadWrite)
         if not ok:
             err = self.serial.errorString()
-            self.append_log(f"Błąd otwarcia portu {port_name}: {err}")
             QMessageBox.critical(
                 self,
                 "Błąd",
@@ -179,25 +172,32 @@ class MainWindow(QWidget):
             )
             return
 
-        self.append_log(f"Połączono z {port_name}")
-        self.status_timer.start(1000)
+        self.last_status = {}
+        self.status_label.setText("Połączono. Oczekiwanie na status...")
+        self.update_buttons_from_state()
+        self.update_mode_controls()
+        self.status_timer.start(200)
+        self.send_command("STATUS")
 
     @Slot()
     def disconnect_port(self):
         self.status_timer.stop()
         if self.serial.isOpen():
             self.serial.close()
-            self.append_log("Rozłączono port.")
 
-    def send_command(self, cmd: str):
+        self.last_status = {}
+        self.status_label.setText("Brak statusu")
+        self.update_buttons_from_state()
+        self.update_mode_controls()
+
+    def send_command(self, cmd: str) -> bool:
         if not self.serial.isOpen():
             QMessageBox.warning(self, "Błąd", "Najpierw połącz port.")
-            return
+            return False
 
         payload = (cmd.strip() + "\n").encode("utf-8")
         written = self.serial.write(payload)
-        if written == -1:
-            self.append_log(f"Błąd wysyłania komendy: {cmd}")
+        return written != -1
 
     def apply_config(self):
         mode = "VEL" if self.vel_radio.isChecked() else "POS"
@@ -213,21 +213,61 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Błąd", "RPM, MAX RPM, ACC i DEC muszą być ustawione.")
             return
 
-        self.send_command(f"MODE {mode}")
-        self.send_command(f"SET RPM {rpm}")
-        self.send_command(f"SET MAXRPM {maxrpm}")
-        self.send_command(f"SET ACC {acc}")
-        self.send_command(f"SET DEC {dec}")
+        commands = [
+            f"MODE {mode}",
+            f"SET RPM {rpm}",
+            f"SET MAXRPM {maxrpm}",
+            f"SET ACC {acc}",
+            f"SET DEC {dec}",
+        ]
 
         if mode == "POS":
             if not pos:
                 QMessageBox.warning(self, "Błąd", "Pozycja musi być ustawiona.")
                 return
-            self.send_command(f"POSMODE {posmode}")
-            self.send_command(f"SET POS {pos}")
+            commands.append(f"POSMODE {posmode}")
+            commands.append(f"SET POS {pos}")
 
-        self.send_command("APPLY")
-        self.append_log("Zastosowano konfigurację.")
+        commands.append("APPLY")
+
+        for cmd in commands:
+            if not self.send_command(cmd):
+                QMessageBox.warning(self, "Błąd", f"Nie udało się wysłać komendy: {cmd}")
+                return
+
+    def is_drive_enabled(self):
+        return self.last_status.get("EN", "0") in ("1", "true", "TRUE", "ON")
+
+    def update_buttons_from_state(self):
+        connected = self.serial.isOpen()
+        enabled = self.is_drive_enabled() if connected else False
+
+        self.refresh_btn.setEnabled(not connected)
+        self.connect_btn.setEnabled(not connected)
+        self.disconnect_btn.setEnabled(connected)
+        self.port_combo.setEnabled(not connected)
+
+        self.vel_radio.setEnabled(connected)
+        self.pos_radio.setEnabled(connected)
+
+        self.rpm_edit.setEnabled(connected)
+        self.maxrpm_edit.setEnabled(connected)
+        self.acc_edit.setEnabled(connected)
+        self.dec_edit.setEnabled(connected)
+
+        is_pos = self.pos_radio.isChecked()
+        self.abs_radio.setEnabled(connected and is_pos)
+        self.rel_radio.setEnabled(connected and is_pos)
+        self.pos_edit.setEnabled(connected and is_pos)
+
+        self.apply_btn.setEnabled(connected)
+        self.run_btn.setEnabled(connected)
+        self.stop_btn.setEnabled(connected)
+
+        self.enable_btn.setEnabled(connected and not enabled)
+        self.disable_btn.setEnabled(connected and enabled)
+
+        self.status_btn.setEnabled(connected)
 
     @Slot()
     def request_status(self):
@@ -252,6 +292,8 @@ class MainWindow(QWidget):
                         k, v = token.split("=", 1)
                         parts[k] = v
 
+                self.last_status = parts
+
                 mode = parts.get("MODE", "?")
                 posmode = parts.get("POSMODE", "?")
                 rpm = parts.get("RPM", "?")
@@ -271,8 +313,8 @@ class MainWindow(QWidget):
                     f"Target reached: {tr} | Ack: {ack} | SW: {sw}"
                 )
                 self.status_label.setText(pretty)
-            else:
-                self.append_log(f"Odebrano: {line}")
+                self.update_buttons_from_state()
+                self.update_mode_controls()
 
 
 if __name__ == "__main__":
