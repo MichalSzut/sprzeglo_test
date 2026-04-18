@@ -33,6 +33,7 @@ struct DriveConfig {
   PositionCommandMode posMode = POS_ABS;
 
   int32_t rpm = 200;
+  int32_t maxRpm = 7000;
   uint32_t acc = 10;
   uint32_t dec = 10;
   int32_t pos = 0;
@@ -45,14 +46,6 @@ String serialLine;
 // =========================
 // LOG
 // =========================
-static void printBytes(const uint8_t *data, uint8_t len) {
-  for (uint8_t i = 0; i < len; i++) {
-    Serial.print(" ");
-    if (data[i] < 0x10) Serial.print("0");
-    Serial.print(data[i], HEX);
-  }
-}
-
 static void printAbort(const uint8_t data[8]) {
   uint32_t abortCode =
       ((uint32_t)data[4]) |
@@ -84,14 +77,6 @@ static bool canSendFrame(uint16_t id, uint8_t dlc, const uint8_t data[8]) {
     Serial.println(rc);
     return false;
   }
-
-  Serial.print("DBG TX ID=0x");
-  Serial.print(id, HEX);
-  Serial.print(" DLC=");
-  Serial.print(dlc);
-  Serial.print(" DATA:");
-  printBytes(data, dlc);
-  Serial.println();
   return true;
 }
 
@@ -103,19 +88,11 @@ static bool waitFrame(uint16_t expectedId, uint8_t *dlc, uint8_t data[8], uint32
       unsigned long rxId = 0;
       CAN0.readMsgBuf(&rxId, dlc, data);
 
-      Serial.print("DBG RX ID=0x");
-      Serial.print((uint16_t)rxId, HEX);
-      Serial.print(" DLC=");
-      Serial.print(*dlc);
-      Serial.print(" DATA:");
-      printBytes(data, *dlc);
-      Serial.println();
-
       if ((uint16_t)rxId == expectedId) {
         return true;
       }
     }
-    delay(2);
+    delay(1);
   }
 
   Serial.print("ERR TIMEOUT 0x");
@@ -312,23 +289,23 @@ static bool disableDrive() {
 // TRYBY
 // =========================
 static bool applyVelocityMode() {
-  if (!sdoWriteU8(0x6060, 0x00, 3)) return false;               // Profile Velocity Mode
-  if (!sdoWriteU32(0x607F, 0x00, (uint32_t)cfg.rpm)) return false;
+  if (!sdoWriteU8(0x6060, 0x00, 3)) return false;
+  if (!sdoWriteU32(0x607F, 0x00, (uint32_t)cfg.maxRpm)) return false;
   if (!sdoWriteU32(0x6083, 0x00, cfg.acc)) return false;
   if (!sdoWriteU32(0x6084, 0x00, cfg.dec)) return false;
-  if (!sdoWriteU16(0x6086, 0x00, 0)) return false;             // linear ramp
+  if (!sdoWriteU16(0x6086, 0x00, 0)) return false;
   return true;
 }
 
 static bool applyPositionMode() {
-  if (!sdoWriteU8(0x6060, 0x00, 1)) return false;               // Profile Position Mode
-  if (!sdoWriteU32(0x607F, 0x00, (uint32_t)cfg.rpm)) return false;
+  if (!sdoWriteU8(0x6060, 0x00, 1)) return false;
+  if (!sdoWriteU32(0x607F, 0x00, (uint32_t)cfg.maxRpm)) return false;
   if (!sdoWriteU32(0x6081, 0x00, (uint32_t)cfg.rpm)) return false;
   if (!sdoWriteU32(0x6083, 0x00, cfg.acc)) return false;
   if (!sdoWriteU32(0x6084, 0x00, cfg.dec)) return false;
-  if (!sdoWriteU16(0x6086, 0x00, 0)) return false;             // linear ramp
-  if (!sdoWriteU32(0x6067, 0x00, 50)) return false;            // position window
-  if (!sdoWriteU16(0x6068, 0x00, 100)) return false;           // position window time
+  if (!sdoWriteU16(0x6086, 0x00, 0)) return false;
+  if (!sdoWriteU32(0x6067, 0x00, 50)) return false;
+  if (!sdoWriteU16(0x6068, 0x00, 100)) return false;
   return true;
 }
 
@@ -348,8 +325,6 @@ static bool runVelocity() {
   return true;
 }
 
-// poprawka STOP:
-// zamiast tylko jednego impulsu, zatrzymujemy bardziej zdecydowanie
 static bool stopVelocity() {
   if (!sdoWriteI32(0x60FF, 0x00, 0)) return false;
 
@@ -359,7 +334,6 @@ static bool stopVelocity() {
   if (!writeControlword(0x000F)) return false;
   delay(30);
 
-  // drugi raz dla pewności
   if (!sdoWriteI32(0x60FF, 0x00, 0)) return false;
   if (!writeControlword(0x010F)) return false;
   delay(30);
@@ -373,26 +347,9 @@ static bool waitForTargetReached(uint32_t timeoutMs = 20000) {
 
   while (millis() - start < timeoutMs) {
     uint16_t sw = 0;
-    int32_t pos = 0;
-
-    bool swOk = readStatusword(sw);
-    bool posOk = readActualPosition(pos);
-
-    Serial.print("POS_WAIT SW=");
-    if (swOk) Serial.print(sw, HEX); else Serial.print("ERR");
-
-    Serial.print(" POS_ACT=");
-    if (posOk) Serial.print(pos); else Serial.print("ERR");
-
-    Serial.print(" TR=");
-    if (swOk) Serial.print(isTargetReached(sw) ? 1 : 0); else Serial.print("ERR");
-
-    Serial.println();
-
-    if (swOk && isTargetReached(sw)) {
+    if (readStatusword(sw) && isTargetReached(sw)) {
       return true;
     }
-
     delay(100);
   }
 
@@ -419,7 +376,6 @@ static bool runPosition() {
   if (!writeControlword(cwStart)) return false;
   delay(20);
 
-  // zostawiamy tryb ABS/REL, kasujemy tylko impuls new set-point
   if (!writeControlword(cwPrepare)) return false;
 
   if (!waitForTargetReached(20000)) {
@@ -434,7 +390,6 @@ static bool runPosition() {
 static bool stopDrive() {
   if (cfg.mode == MODE_VELOCITY) return stopVelocity();
 
-  // dla pozycji: disable operation + disable voltage, żeby stop był wyraźny
   if (!disableOperation()) return false;
   delay(30);
   if (!disableVoltage()) return false;
@@ -443,8 +398,24 @@ static bool stopDrive() {
 }
 
 // =========================
-// STATUS
+// STATUS / TELEM
 // =========================
+static void sendTelemetry() {
+  int32_t vel = 0;
+  int32_t pos = 0;
+
+  bool velOk = readActualVelocity(vel);
+  bool posOk = readActualPosition(pos);
+
+  Serial.print("TELEM VEL=");
+  if (velOk) Serial.print(vel); else Serial.print("ERR");
+
+  Serial.print(" POS=");
+  if (posOk) Serial.print(pos); else Serial.print("ERR");
+
+  Serial.println();
+}
+
 static void sendStatus() {
   uint16_t sw = 0;
   int32_t vel = 0;
@@ -462,6 +433,9 @@ static void sendStatus() {
 
   Serial.print(" RPM=");
   Serial.print(cfg.rpm);
+
+  Serial.print(" MAXRPM=");
+  Serial.print(cfg.maxRpm);
 
   Serial.print(" ACC=");
   Serial.print(cfg.acc);
@@ -499,9 +473,6 @@ static void sendStatus() {
 static void handleCommand(String line) {
   line.trim();
   if (line.length() == 0) return;
-
-  Serial.print("CMD ");
-  Serial.println(line);
 
   if (line == "PING") {
     sendOk("PONG");
@@ -541,6 +512,11 @@ static void handleCommand(String line) {
 
   if (line == "STATUS") {
     sendStatus();
+    return;
+  }
+
+  if (line == "TELEM") {
+    sendTelemetry();
     return;
   }
 
@@ -607,6 +583,12 @@ static void handleCommand(String line) {
       return;
     }
 
+    if (key == "MAXRPM") {
+      cfg.maxRpm = (int32_t)parsed;
+      sendOk("SET MAXRPM");
+      return;
+    }
+
     if (key == "ACC") {
       cfg.acc = (uint32_t)parsed;
       sendOk("SET ACC");
@@ -643,6 +625,11 @@ static void readSerialCommands() {
       }
     } else {
       serialLine += c;
+
+      if (serialLine.length() > 120) {
+        serialLine = "";
+        sendErr("LINE_TOO_LONG");
+      }
     }
   }
 }
@@ -675,10 +662,4 @@ void setup() {
 
 void loop() {
   readSerialCommands();
-
-  static uint32_t lastStatus = 0;
-  if (millis() - lastStatus > 1000) {
-    lastStatus = millis();
-    sendStatus();
-  }
 }
